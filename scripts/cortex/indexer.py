@@ -162,6 +162,13 @@ def index_workspace(workspace: str, force: bool = False) -> dict:
     files = scan_files(workspace)
     stats = {"total_files": len(files), "indexed": 0, "skipped": 0, "errors": 0}
     
+    # ⚡ BOLT OPTIMIZATION: Batch variables to replace N+1 queries with executemany
+    nodes_to_insert = []
+    edges_to_insert = []
+    file_cache_to_insert = []
+    old_ids_to_delete = []
+    files_to_delete_nodes = []
+
     for rel_path in files:
         full_path = os.path.join(workspace, rel_path)
         try:
@@ -189,26 +196,17 @@ def index_workspace(workspace: str, force: bool = False) -> dict:
             stats["errors"] += 1
             continue
             
-        # 기존 데이터 삭제
+        # ⚡ BOLT OPTIMIZATION: Collect IDs for batched deletion
         old_nodes = conn.execute("SELECT id FROM nodes WHERE file_path = ?", (rel_path,)).fetchall()
         old_ids = [r[0] for r in old_nodes]
         if old_ids:
-            ph = ",".join("?" * len(old_ids))
-            conn.execute(f"DELETE FROM edges WHERE source_id IN ({ph})", old_ids)
-            conn.execute(f"DELETE FROM edges WHERE target_id IN ({ph})", old_ids)
-            conn.execute("DELETE FROM nodes WHERE file_path = ?", (rel_path,))
+            old_ids_to_delete.extend(old_ids)
+            files_to_delete_nodes.append((rel_path,))
             
         # 노드/벡터 저장
         for node in result["nodes"]:
             cat = "SKILL" if "skills/" in rel_path or "skills\\" in rel_path else "SOURCE"
-            conn.execute("""
-                INSERT OR REPLACE INTO nodes 
-                (id, type, name, fqn, file_path, start_line, end_line,
-                 signature, return_type, docstring, is_exported, is_async,
-                 is_test, raw_body, skeleton_standard, skeleton_minimal, language,
-                 module, workspace_id, category)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+            nodes_to_insert.append((
                 node["id"], node["type"], node["name"], node["fqn"],
                 node["file_path"], node["start_line"], node["end_line"],
                 node.get("signature"), node.get("return_type"), node.get("docstring"),
@@ -230,12 +228,40 @@ def index_workspace(workspace: str, force: bool = False) -> dict:
             
         # 엣지 저장
         for edge in result["edges"]:
-            conn.execute("INSERT OR IGNORE INTO edges (source_id, target_id, type) VALUES (?, ?, ?)",
-                         (edge["source_id"], edge["target_id"], edge.get("type", "CALLS")))
+            edges_to_insert.append((edge["source_id"], edge["target_id"], edge.get("type", "CALLS")))
             
-        conn.execute("INSERT OR REPLACE INTO file_cache (file_path, hash, last_indexed_at, workspace_id) VALUES (?, ?, ?, ?)",
-                     (rel_path, file_hash, int(time.time()), workspace_id))
+        file_cache_to_insert.append((rel_path, file_hash, int(time.time()), workspace_id))
         stats["indexed"] += 1
+
+    # ⚡ BOLT OPTIMIZATION: Execute batched deletions
+    if old_ids_to_delete:
+        # SQLite historical variable limits max out around 999. Batching in chunks of 900.
+        chunk_size = 900
+        for i in range(0, len(old_ids_to_delete), chunk_size):
+            chunk = old_ids_to_delete[i:i + chunk_size]
+            ph = ",".join("?" * len(chunk))
+            conn.execute(f"DELETE FROM edges WHERE source_id IN ({ph})", chunk)
+            conn.execute(f"DELETE FROM edges WHERE target_id IN ({ph})", chunk)
+
+    if files_to_delete_nodes:
+        conn.executemany("DELETE FROM nodes WHERE file_path = ?", files_to_delete_nodes)
+
+    # ⚡ BOLT OPTIMIZATION: Execute batched insertions
+    if nodes_to_insert:
+        conn.executemany("""
+            INSERT OR REPLACE INTO nodes
+            (id, type, name, fqn, file_path, start_line, end_line,
+             signature, return_type, docstring, is_exported, is_async,
+             is_test, raw_body, skeleton_standard, skeleton_minimal, language,
+             module, workspace_id, category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, nodes_to_insert)
+
+    if edges_to_insert:
+        conn.executemany("INSERT OR IGNORE INTO edges (source_id, target_id, type) VALUES (?, ?, ?)", edges_to_insert)
+
+    if file_cache_to_insert:
+        conn.executemany("INSERT OR REPLACE INTO file_cache (file_path, hash, last_indexed_at, workspace_id) VALUES (?, ?, ?, ?)", file_cache_to_insert)
 
     # 벡터 인덱싱
     if vector_items:

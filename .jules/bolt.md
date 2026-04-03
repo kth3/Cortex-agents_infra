@@ -1,0 +1,3 @@
+## 2024-05-18 - Replacing N+1 DB Queries with executemany in Indexer
+**Learning:** Found a specific performance bottleneck where SQLite inserts were done iteratively in a loop in `index_workspace` inside `scripts/cortex/indexer.py`.
+**Action:** Used `executemany` with batched tuples to drastically optimize the insertion pipeline. Ensure all bulk modifications (insert/delete) leverage batch execution and SQLite's 999 max limits constraints where applicable.
