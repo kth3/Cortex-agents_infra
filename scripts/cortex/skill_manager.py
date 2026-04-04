@@ -107,18 +107,6 @@ class EmbeddingEngine:
         return [None] * len(texts)
 
 
-def _cosine_similarity(blob_a: bytes, blob_b: bytes) -> float:
-    try:
-        import numpy as np
-        a = np.frombuffer(blob_a, dtype=np.float32)
-        b = np.frombuffer(blob_b, dtype=np.float32)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0: return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
-    except Exception:
-        return 0.0
-
 def _parse_skill_md(skill_md_path: str) -> dict:
     try:
         with open(skill_md_path, "r", encoding="utf-8") as f:
