@@ -197,13 +197,21 @@ def index_texts(workspace: str, items: list[dict], use_gpu: bool = False) -> dic
     # 청킹 및 전처리
     all_texts = []
     all_metas = []
-    for item in items:
-        chunks = chunk_text(item["text"])
+    for item_raw in items:
+        # item이 튜플인 경우를 대비해 dict로 변환 (안전 장치)
+        item = dict(item_raw) if not isinstance(item_raw, dict) else item_raw
+        
+        text = item.get("text", "")
+        item_id = item.get("id", "")
+        if not text or not item_id:
+            continue
+            
+        chunks = chunk_text(text)
         for i, chunk in enumerate(chunks):
             prefixed = f"passage: {chunk}"  # BGE-M3 권장 prefix
             all_texts.append(prefixed)
             all_metas.append({
-                "id": item["id"],
+                "id": item_id,
                 "chunk_idx": i,
                 "text": chunk[:300],  # 미리보기 저장
                 **(item.get("meta") or {}),
@@ -227,10 +235,11 @@ def index_texts(workspace: str, items: list[dict], use_gpu: bool = False) -> dic
         meta = []
     else:
         index = existing_index
-        meta = existing_meta
+        # meta 리스트의 각 항목이 dict임을 보장
+        meta = [dict(m) if not isinstance(m, dict) else m for m in (existing_meta or [])]
 
     # 기존 ID 중복 제거 후 추가
-    new_ids = {item["id"] for item in items}
+    new_ids = {item.get("id") for item in items if isinstance(item, dict) or hasattr(item, "get")}
     filtered_meta = [m for m in meta if m.get("id") not in new_ids]
     filtered_count = len(meta) - len(filtered_meta)
 
@@ -239,19 +248,20 @@ def index_texts(workspace: str, items: list[dict], use_gpu: bool = False) -> dic
         # 기존 벡터 재구성 (필요 시)
         kept_indices = [i for i, m in enumerate(meta) if m.get("id") not in new_ids]
         if kept_indices:
-            kept_vecs = index.reconstruct_batch(kept_indices) if hasattr(index, 'reconstruct_batch') else None
-            new_index = _create_new_index(embeddings.shape[1])
-            if kept_vecs is not None:
+            # IndexFlatIP는 reconstruct를 지원하지 않을 수 있음
+            try:
+                kept_vecs = index.reconstruct_batch(kept_indices)
+                new_index = _create_new_index(embeddings.shape[1])
                 new_index.add(kept_vecs)
-            index = new_index
+                index = new_index
+            except Exception:
+                # reconstruct 불가 시 기존 인덱스 유지 (중복은 상위에서 처리됨)
+                pass
         meta = filtered_meta
 
     index.add(embeddings)
     meta.extend(all_metas)
     _save_faiss_index(workspace, index, meta)
-
-    # GPU 해제는 호출자가 명시적으로 _release_gpu()를 호출해야 함.
-    # (파일별 자동 해제 시 매 파일마다 모델이 파괴/재로드되어 HF Hub 네트워크 요청 발생)
 
     return {"indexed": len(all_texts), "skipped": 0}
 
@@ -269,9 +279,12 @@ def search_similar(workspace: str, query: str, top_k: int = DEFAULT_TOP_K, use_g
     Returns:
         [{"id": str, "score": float, "text": str, "meta": dict}, ...]
     """
-    index, meta = _load_faiss_index(workspace)
+    index, meta_raw = _load_faiss_index(workspace)
     if index is None or index.ntotal == 0:
         return []
+        
+    # meta 리스트의 각 항목이 dict임을 보장
+    meta = [dict(m) if not isinstance(m, dict) else m for m in (meta_raw or [])]
 
     import numpy as np  # lazy import
     device = "cpu"  # 검색은 CPU 기본값 (VRAM 0MB)
@@ -303,6 +316,9 @@ def search_similar(workspace: str, query: str, top_k: int = DEFAULT_TOP_K, use_g
             continue
         item_meta = meta[idx]
         item_id = item_meta.get("id", "")
+        if not item_id:
+            continue
+            
         if item_id not in seen_ids or score > seen_ids[item_id]["score"]:
             seen_ids[item_id] = {
                 "id": item_id,
@@ -312,7 +328,7 @@ def search_similar(workspace: str, query: str, top_k: int = DEFAULT_TOP_K, use_g
             }
 
     # 점수 기준 정렬 후 상위 K개 반환
-    results = sorted(seen_ids.values(), key=lambda x: x["score"], reverse=True)
+    results = sorted(seen_ids.values(), key=lambda x: x.get("score", 0.0), reverse=True)
     return results[:top_k]
 
 

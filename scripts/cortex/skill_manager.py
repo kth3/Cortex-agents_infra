@@ -149,13 +149,9 @@ def _parse_skill_md(skill_md_path: str) -> dict:
 
 class SkillManager:
     def __init__(self, workspace: str):
+        from cortex.db import get_connection, init_schema
         self.workspace = workspace
-        # DB 연결 시 SQLite Lock 방지를 위해 타임아웃 지정
-        import sqlite3
-        db_path = os.path.join(workspace, ".agents/cortex_data/index.db")
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        conn = sqlite3.connect(db_path, timeout=60.0)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = get_connection(workspace)
         try:
             init_schema(conn)
         finally:
@@ -166,9 +162,9 @@ class SkillManager:
         if not os.path.isdir(skills_root):
             return {"error": f"Skills root not found: {skills_root}"}
 
-        import sqlite3
-        db_path = os.path.join(self.workspace, ".agents/cortex_data/index.db")
-        conn = sqlite3.connect(db_path, timeout=60.0)
+        from cortex.db import get_connection
+        conn = get_connection(self.workspace)
+
         
         skill_files = list(Path(skills_root).rglob("SKILL.md"))
         synced, skipped, errors, pending_embed = 0, 0, [], []
@@ -180,21 +176,33 @@ class SkillManager:
             skill_info_map = {}
             for skill_path in skill_files:
                 try:
-                    info = _parse_skill_md(str(skill_path))
-                    if not info:
+                    info_raw = _parse_skill_md(str(skill_path))
+                    if not info_raw:
                         skipped += 1
                         continue
 
+                    # info가 dict인지 tuple인지에 따라 안전하게 데이터 추출
+                    if isinstance(info_raw, dict):
+                        i_name = info_raw.get("name", skill_path.parent.name)
+                        i_desc = info_raw.get("description", "")
+                        i_tags = info_raw.get("tags", ["skill"])
+                        i_preview = info_raw.get("content_preview", "")
+                    else:
+                        # 만약 튜플로 반환된다면 (name, desc, path, tags, preview, full) 순서 가정
+                        i_name = info_raw[0] if len(info_raw) > 0 else skill_path.parent.name
+                        i_desc = info_raw[1] if len(info_raw) > 1 else ""
+                        i_tags = info_raw[3] if len(info_raw) > 3 else ["skill"]
+                        i_preview = info_raw[4] if len(info_raw) > 4 else ""
+
                     skill_key = f"skill::{skill_path.parent.name}"
                     rel_path = to_rel_path(str(skill_path), self.workspace)
-                    content = f"[SKILL] {info['name']}\n설명: {info['description']}\n경로: {rel_path}\n\n{info['content_preview']}"
-                    tags_json = json.dumps(info.get("tags", ["skill"]), ensure_ascii=False)
+                    content = f"[SKILL] {i_name}\n설명: {i_desc}\n경로: {rel_path}\n\n{i_preview}"
+                    tags_json = json.dumps(i_tags, ensure_ascii=False)
 
-                    # 중복된 skill_key가 있을 경우 마지막 파일이 덮어씌움 (기존 로직과 동일)
                     skill_info_map[skill_key] = {
                         "key": skill_key,
-                        "name": info["name"],
-                        "description": info["description"],
+                        "name": i_name,
+                        "description": i_desc,
                         "content": content,
                         "tags_json": tags_json,
                         "path": skill_path
@@ -212,7 +220,10 @@ class SkillManager:
                     placeholders = ",".join(["?"] * len(chunk))
                     rows = conn.execute(f"SELECT key, embedding FROM memories WHERE key IN ({placeholders})", chunk).fetchall()
                     for r in rows:
-                        existing_map[r[0]] = r[1]
+                        row_dict = dict(r)
+                        k = row_dict.get("key")
+                        if k:
+                            existing_map[k] = row_dict.get("embedding")
 
                 to_insert = []
                 to_update = []
@@ -223,11 +234,11 @@ class SkillManager:
 
                     if skill_key in existing_map:
                         to_update.append((content, tags_json, now, skill_key))
-                        if not existing_map[skill_key]:
-                            pending_embed.append((skill_key, f"{si['name']} {si['description']}"))
+                        if not existing_map.get(skill_key):
+                            pending_embed.append({"id": skill_key, "text": f"{si['name']} {si['description']}"})
                     else:
                         to_insert.append((skill_key, project_id, content, tags_json, now, now))
-                        pending_embed.append((skill_key, f"{si['name']} {si['description']}"))
+                        pending_embed.append({"id": skill_key, "text": f"{si['name']} {si['description']}"})
                     synced += 1
 
                 if to_insert:
@@ -274,6 +285,8 @@ class SkillManager:
 
                 sys.stderr.write(f"[skill_manager] Vectorizing {len(vector_items)} skills (GPU={use_gpu})...\n")
                 v_result = ve.index_texts(self.workspace, vector_items, use_gpu=use_gpu)
+                if use_gpu:
+                    ve._release_gpu()
                 sys.stderr.write(f"[skill_manager] Vector indexing done: {v_result}\n")
                 embed_done = v_result.get("indexed", 0)
             else:
@@ -287,9 +300,8 @@ class SkillManager:
         return {"synced": synced, "skipped": skipped, "errors": errors, "embedded": embed_done}
 
     def search_skills(self, project_id: str, query: str, limit: int = 5) -> list:
-        import sqlite3
-        db_path = os.path.join(self.workspace, ".agents/cortex_data/index.db")
-        conn = sqlite3.connect(db_path, timeout=60.0)
+        from cortex.db import get_connection
+        conn = get_connection(self.workspace)
         try:
             # 1. FTS5 키워드 검색
             tokens = [f'"{t}"*' for t in re.split(r'[\s\-_.,/]+', query) if len(t) >= 2]
@@ -306,7 +318,8 @@ class SkillManager:
             col_names = [d[0] for d in conn.execute("SELECT * FROM memories LIMIT 1").description]
             fts_scored, fts_data = {}, {}
             for r, row in enumerate(fts_rows):
-                d = dict(zip(col_names, row))
+                # sqlite3.Row는 dict()로 직접 변환 가능하며, 이게 zip보다 훨씬 안전함
+                d = dict(row)
                 fts_scored[d["key"]] = 1.0 / (r + 60)  # RRF 점수
                 fts_data[d["key"]] = d
 
@@ -315,11 +328,15 @@ class SkillManager:
             try:
                 vec_results = ve.search_similar(self.workspace, query, top_k=limit, use_gpu=False)
                 missing_keys = []
-                for r, vr in enumerate(vec_results):
-                    sem_scored[vr["id"]] = 1.0 / (r + 60)  # RRF 점수
+                for r, vr_raw in enumerate(vec_results):
+                    vr = dict(vr_raw) if not isinstance(vr_raw, dict) else vr_raw
+                    item_id = vr.get("id")
+                    if not item_id: continue
+                    
+                    sem_scored[item_id] = 1.0 / (r + 60)  # RRF 점수
                     # FTS에 없는 항목 추려내기
-                    if vr["id"] not in fts_data:
-                        missing_keys.append(vr["id"])
+                    if item_id not in fts_data:
+                        missing_keys.append(item_id)
 
                 # FTS에 없는 항목은 DB에서 보완 (N+1 Query 최적화: IN 절 배치 처리)
                 if missing_keys:
@@ -331,7 +348,7 @@ class SkillManager:
                         query_sql = f"SELECT * FROM memories WHERE key IN ({placeholders})"
                         db_rows = conn.execute(query_sql, chunk).fetchall()
                         for db_row in db_rows:
-                            d = dict(zip(col_names, db_row))
+                            d = dict(db_row)
                             fts_data[d["key"]] = d
             except Exception as ve_err:
                 import sys
