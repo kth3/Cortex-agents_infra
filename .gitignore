@@ -1,0 +1,24 @@
+# Python & Runtime
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.env
+
+# Dynamic Data (Protected)
+data/
+history/
+!history/inbox.md
+state/
+
+# Project-Specific Assets (Isolated)
+rules/*/
+!rules/core/
+docs/
+
+# Metadata
+PROGRESS.md
+
+# Allow .gitkeep in all ignored directories
+!**/.gitkeep
